@@ -1,0 +1,63 @@
+name: Create RDP VM (Vast.ai) and Join Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Hostname pentru VM"
+        required: true
+        default: "rdp-vm"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # ~6 ore
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Generate random credentials
+        id: creds
+        run: |
+          import secrets, string, random
+          user = "user" + ''.join(random.choices(string.ascii_lowercase, k=4))
+          pw = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+          with open("creds.txt","w") as f:
+              f.write(f"USER={user}\nPASS={pw}\n")
+          print(f"::set-output name=user::{user}")
+          print(f"::set-output name=pass::{pw}")
+        shell: python
+
+      - name: Show generated credentials
+        run: |
+          echo "User: ${{ steps.creds.outputs.user }}"
+          echo "Pass: ${{ steps.creds.outputs.pass }}"
+
+      - name: Deploy VM on Vast.ai (search only if no API key)
+        run: |
+          if [ -z "${{ secrets.VAST_API_KEY }}" ]; then
+            echo "Nu exista VAST_API_KEY -> fac doar search de oferte"
+            curl -s "https://vast.ai/api/v0/bundles?verified=true&gpu_name=RTX%203060%20Ti&min_ram=64000&min_disk=1000" | jq '.'
+            exit 0
+          fi
+          echo "Aici vine codul real de create lease + setup xrdp"
+
+      - name: Connect Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y tailscale
+          sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=${{ github.event.inputs.hostname }}
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: deploy-log
+          path: creds.txt
+          
