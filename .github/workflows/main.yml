@@ -1,0 +1,163 @@
+name: Create RDP VM (Vast.ai) and Join Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Hostname for the instance (used as Tailscale hostname)'
+        required: false
+        default: gh-rdp
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.deploy.outputs.instance_ip }}
+      instance_user: ${{ steps.deploy.outputs.instance_user }}
+      instance_pass: ${{ steps.deploy.outputs.instance_pass }}
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Create deploy script
+        run: |
+          cat > deploy_vast.py <<'PY'
+#!/usr/bin/env python3
+# Best-effort script to locate a suitable offer on Vast.ai and request a lease.
+# IMPORTANT: Vast.ai's API/paths may change. This script is provided as a starting
+# point. You MUST provide a VAST_API_KEY secret in the repo for actual creation.
+
+import os
+import time
+import json
+import requests
+
+VAST_API_KEY = os.environ.get('VAST_API_KEY')
+TAILSCALE_AUTH_KEY = os.environ.get('TAILSCALE_AUTH_KEY')
+HOSTNAME = os.environ.get('INPUT_hostname','gh-rdp')
+
+if not TAILSCALE_AUTH_KEY:
+    print('ERROR: TAILSCALE_AUTH_KEY is required (set as a secret).')
+    exit(2)
+
+if not VAST_API_KEY:
+    print('WARNING: VAST_API_KEY not provided. This run will only *search* offers and print a recommended command to run locally with your VAST_API_KEY.\n')
+
+# Search for candidate offers (query bundles)
+search_url = 'https://api.vast.ai/v0/bundles'
+params = {
+    'type': 'on-demand',
+    'verified': 'true',
+    # request RTX 3060-ish devices; providers label GPUs differently — this is a best-effort filter
+    'q': 'gpu:3060; ram:64000; disk:1000; cpu_vendor:intel',
+}
+print('Searching for candidate offers on Vast.ai...')
+resp = requests.get(search_url, params=params, timeout=30)
+if resp.status_code != 200:
+    print('Search failed (status)', resp.status_code)
+    print(resp.text)
+    # continue — we'll show instructions
+    offers = []
+else:
+    data = resp.json()
+    offers = data.get('offers') or data.get('bundles') or []
+
+if not offers:
+    print('\nNo offers returned by the public search (this is common).\n')
+    print('If you have a VAST_API_KEY, set it as a repo secret and re-run the workflow to automatically request a lease.\n')
+    print('Below is a suggested curl command you can run locally (replace <VAST_API_KEY> and TAILSCALE_AUTH_KEY):\n')
+    print('  export VAST_API_KEY="<your_key>"')
+    print('  export TAILSCALE_AUTH_KEY="%s"' % TAILSCALE_AUTH_KEY)
+    print('  # then run the repo workflow or an API call to request a lease with the filters: ram>=64000, disk>=1000, gpu~3060, cpu_vendor=intel')
+    exit(0)
+
+# Pick the cheapest suitable offer
+offer = sorted(offers, key=lambda o: float(o.get('price','9999')))[0]
+print('\nSelected offer:')
+print(json.dumps(offer, indent=2)[:2000])
+
+# If no VAST_API_KEY present, stop here and show info
+if not VAST_API_KEY:
+    print('\nYou can use the above offer id to request a lease via the Vast.ai UI or API with your VAST_API_KEY.\n')
+    exit(0)
+
+# NOTE: The exact create/lease endpoint and payload may vary. The code below is
+# a *best-effort template* to illustrate how to programmatically request an instance.
+create_url = 'https://api.vast.ai/v0/leases'
+payload = {
+    # these fields may need adaptation to match Vast.ai's current API
+    'bundle_id': offer.get('id'),
+    'docker_image': offer.get('image') if offer.get('image') else None,
+    'duration_hours': 6,
+    'ssh_pubkey': os.environ.get('SSH_PUBKEY', ''),
+    'user_data': (
+        "#!/bin/bash\n"
+        "set -e\n"
+        "# Create user 'rdpuser' and set password (random or fixed)\n"
+        "useradd -m -s /bin/bash rdpuser || true\n"
+        "echo 'rdpuser:ChangeMe123!' | chpasswd || true\n"
+        "# Install desktop + xrdp on Ubuntu/Debian images\n"
+        "if [ -x /usr/bin/apt ]; then\n"
+        "  apt update && apt install -y --no-install-recommends ubuntu-desktop xrdp curl sudo\n"
+        "  systemctl enable xrdp --now\n"
+        "fi\n"
+        "# Install Tailscale and join with auth key\n"
+        "curl -fsSL https://tailscale.com/install.sh | sh\n"
+        "tailscale up --authkey=%s --hostname=%s --accept-routes --accept-dns\n"
+        % (TAILSCALE_AUTH_KEY, HOSTNAME)
+    )
+}
+
+headers = {'Authorization': f'Bearer {VAST_API_KEY}', 'Content-Type': 'application/json'}
+print('\nRequesting a lease from Vast.ai (this may require an account with balance).\n')
+resp = requests.post(create_url, headers=headers, json=payload, timeout=60)
+print('create status:', resp.status_code)
+print(resp.text[:3000])
+
+# The response structure differs between providers — adjust parsing accordingly.
+print('\nIf the request succeeded, the provider will return access details (IP / credentials).\n')
+PY
+
+      - name: Run deploy script (dry-run / create)
+        id: deploy
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          INPUT_hostname: ${{ github.event.inputs.hostname }}
+        run: |
+          chmod +x deploy_vast.py
+          python deploy_vast.py | tee deploy.log
+
+      - name: Upload deploy log
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-log
+          path: deploy.log
+
+      - name: Output notes
+        run: |
+          echo "Done. Check the 'deploy-log' artifact for details."
+
+# IMPORTANT NOTES (README):
+# - This workflow is a starting point. Many cloud marketplaces (including Vast.ai)
+#   require an account + API key to create resources. The script above will *search*
+#   offers without VAST_API_KEY but will only create a lease when VAST_API_KEY is set.
+# - You MUST add the following repository secrets:
+#     - VAST_API_KEY (recommended; required for automated creation)
+#     - TAILSCALE_AUTH_KEY (required) -- this will be used on the remote host so it
+#       joins your Tailscale network automatically.
+#     - (optional) SSH_PUBKEY if you want to inject your SSH key for access instead
+# - The startup script configures an Ubuntu/Debian host with a desktop and xrdp so
+#   you can connect via standard RDP clients. If you need a Windows VM instead,
+#   you will typically need a Windows image offered by the provider; adapt the
+#   user-data and image selection accordingly.
+# - Security: the example sets a default local password `ChangeMe123!`. Change this
+#   to a strong password or use SSH keys. Remove or rotate the Tailscale auth key
+#   after use.
