@@ -1,0 +1,252 @@
+name: Create RDP VM (Vast.ai) and Join Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Tailscale hostname for the instance (optional)'
+        required: false
+        default: rdp-vm
+      ram_gb:
+        description: 'Requested RAM in GB (32 or 64). Defaults to 32.'
+        required: false
+        default: '32'
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      instance_ip: ${{ steps.deploy.outputs.instance_ip }}
+      instance_user: ${{ steps.deploy.outputs.instance_user }}
+      instance_pass: ${{ steps.deploy.outputs.instance_pass }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Create and run deploy script
+        id: deploy
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          HOSTNAME: ${{ github.event.inputs.hostname }}
+          RAM_GB: ${{ github.event.inputs.ram_gb }}
+          GITHUB_OUTPUT: ${{ github.output }}
+        run: |
+          cat > deploy_vast.py <<'PY'
+#!/usr/bin/env python3
+# Deploy script for Vast.ai
+# - prefers Windows 11 images when available; otherwise prefers a 'gaming' image
+# - requests a 6-hour lease
+# - installs xrdp (on Linux) and joins Tailscale
+# - generates random user/password and writes rdp-credentials.txt
+
+import os, sys, time, json, secrets, string, requests
+
+VAST_API_KEY = os.environ.get('VAST_API_KEY')
+TAILSCALE_AUTH_KEY = os.environ.get('TAILSCALE_AUTH_KEY')
+SSH_PUBKEY = os.environ.get('SSH_PUBKEY','')
+HOSTNAME = os.environ.get('HOSTNAME') or 'rdp-vm'
+RAM_GB = int(os.environ.get('RAM_GB') or 32)
+GITHUB_OUTPUT = os.environ.get('GITHUB_OUTPUT')
+
+if not TAILSCALE_AUTH_KEY:
+    print('ERROR: TAILSCALE_AUTH_KEY secret is required. Set it in repo secrets.')
+    sys.exit(2)
+
+# generate random credentials
+def gen_creds():
+    u = 'u' + ''.join(secrets.choice(string.ascii_lowercase+string.digits) for _ in range(8))
+    p = ''.join(secrets.choice(string.ascii_letters+string.digits+'!@#$%&*') for _ in range(16))
+    return u, p
+
+user, pwd = gen_creds()
+print('Generated credentials:', user)
+
+def gh_output(k,v):
+    if GITHUB_OUTPUT:
+        with open(os.environ.get('GITHUB_OUTPUT'),'a') as f:
+            f.write(f"{k}={v}
+")
+    else:
+        print(f"GITHUB_OUTPUT: {k}={v}")
+
+# Public search for candidate bundles
+search_url = 'https://api.vast.ai/v0/bundles'
+query = f'gpu:3060; ram:{RAM_GB*1024}; disk:1000; cpu_vendor:intel'
+params = {'type':'on-demand','verified':'true','q': query}
+print('Searching for candidate offers on Vast.ai with query:', query)
+try:
+    resp = requests.get(search_url, params=params, timeout=30)
+except Exception as e:
+    print('Public search request failed:', e)
+    resp = None
+
+items = []
+if resp and resp.status_code == 200:
+    j = resp.json()
+    items = j.get('offers') or j.get('bundles') or j.get('data') or []
+
+if not items and not VAST_API_KEY:
+    print('No public offers found or VAST_API_KEY not provided. Show top matches if any and exit.')
+    if items:
+        for o in items[:5]:
+            print(json.dumps(o)[:2000])
+    print('
+Add VAST_API_KEY as secret to create automatically.')
+    sys.exit(0)
+
+# prefer Windows images if present, else prefer common gaming images (steam, steamos, pop, gaming)
+def score_offer(o):
+    score = 0.0
+    img = str(o.get('image') or o.get('image_name') or '').lower()
+    desc = str(o.get('desc') or o.get('description') or '').lower()
+    if 'windows' in img or 'windows' in desc or 'win' in img:
+        score -= 1000.0
+    # gaming keywords
+    for k in ['steam','steamos','pop','gaming','geforce','nvidia']:
+        if k in img or k in desc:
+            score -= 100.0
+    # price factor
+    try:
+        score += float(o.get('price', 0))
+    except:
+        score += 9999.0
+    return score
+
+offer = None
+if items:
+    offer = sorted(items, key=score_offer)[0]
+    print('Selected offer id (best-effort):', offer.get('id'))
+
+# If no VAST_API_KEY provided, exit after showing selection
+if not VAST_API_KEY:
+    print('DRY RUN (no VAST_API_KEY). Selected offer (if any):')
+    if offer:
+        print(json.dumps(offer, indent=2)[:2000])
+    else:
+        print('No offer chosen')
+    sys.exit(0)
+
+# Build user-data (for Linux). For Windows images, providers usually provide RDP out-of-the-box and different provisioning is required.
+user_data = f"""#!/bin/bash
+set -e
+# create user and set password
+useradd -m -s /bin/bash {user} || true
+echo '{user}:{pwd}' | chpasswd || true
+usermod -aG sudo {user} || true
+
+# install desktop + xrdp if apt exists
+if [ -x /usr/bin/apt ]; then
+  DEBIAN_FRONTEND=noninteractive apt update
+  apt install -y --no-install-recommends ubuntu-desktop xrdp curl ca-certificates sudo
+  systemctl enable xrdp --now || true
+fi
+
+# install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh || true
+tailscale up --authkey={TAILSCALE_AUTH_KEY} --hostname={HOSTNAME} --accept-routes --accept-dns || true
+
+# add provided SSH key
+if [ -n "{SSH_PUBKEY}" ]; then
+  mkdir -p /home/{user}/.ssh
+  echo "{SSH_PUBKEY}" >> /home/{user}/.ssh/authorized_keys
+  chown -R {user}:{user} /home/{user}/.ssh
+  chmod 700 /home/{user}/.ssh
+  chmod 600 /home/{user}/.ssh/authorized_keys
+fi
+
+# write creds to a file for retrieval
+echo "USER={user}" > /var/log/instance-credentials.txt || true
+echo "PASS={pwd}" >> /var/log/instance-credentials.txt || true
+"""
+
+# Prepare payload
+create_url = 'https://api.vast.ai/v0/leases'
+payload = {'duration_hours': 6, 'user_data': user_data}
+if offer:
+    payload['bundle_id'] = offer.get('id')
+
+headers = {'Authorization': f'Bearer {VAST_API_KEY}', 'Content-Type': 'application/json'}
+print('
+Requesting lease from Vast.ai...')
+try:
+    r = requests.post(create_url, headers=headers, json=payload, timeout=60)
+except Exception as e:
+    print('Lease request failed:', e)
+    sys.exit(1)
+
+print('create status', r.status_code)
+print(r.text[:2000])
+if r.status_code >= 400:
+    print('Create failed, see response above. Exiting.')
+    sys.exit(1)
+lease = r.json()
+lease_id = lease.get('id') or lease.get('lease_id') or lease.get('lease')
+print('Lease id:', lease_id)
+
+# poll lease status for IP
+status_url = f'https://api.vast.ai/v0/leases/{lease_id}'
+for i in range(90):
+    try:
+        rr = requests.get(status_url, headers=headers, timeout=20)
+    except Exception as e:
+        print('Status poll failed:', e)
+        rr = None
+    if rr and rr.status_code == 200:
+        jj = rr.json()
+        # try different keys for ip
+        ip = jj.get('ip') or jj.get('public_ip') or jj.get('access_ip') or jj.get('access') or None
+        if not ip:
+            ip = jj.get('dns') or None
+        print('poll', i, 'status ok')
+        if ip:
+            print('Found IP:', ip)
+            gh_output('instance_ip', ip)
+            gh_output('instance_user', user)
+            gh_output('instance_pass', pwd)
+            # also write to a local file for artifact
+            with open('rdp-credentials.txt','w') as f:
+                f.write(f'USER={user}
+PASS={pwd}
+IP={ip}
+')
+            sys.exit(0)
+    else:
+        if rr:
+            print('poll failed', rr.status_code, rr.text[:400])
+    time.sleep(10)
+
+print('Timed out waiting for IP. Check Vast.ai console for lease details.')
+with open('rdp-credentials.txt','w') as f:
+    f.write(f'USER={user}
+PASS={pwd}
+')
+sys.exit(1)
+PY
+
+          python deploy_vast.py 2>&1 | tee deploy.log || true
+
+      - name: Upload artifacts (credentials + logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: rdp-credentials.txt
+
+      - name: Upload deploy log
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-log
+          path: deploy.log
+
+      - name: Print summary
+        run: |
+          echo "If creation succeeded, artifacts 'rdp-credentials' and 'deploy-log' contain IP/user/pass."
+          
