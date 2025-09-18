@@ -1,0 +1,73 @@
+name: Create RDP VM with Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Hostname pentru VM"
+        required: true
+        default: "rdp-vm"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # rulează max 6 ore
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Generate random credentials
+        id: creds
+        run: |
+          import secrets, string, random, os
+          user = "user" + ''.join(random.choices(string.ascii_lowercase, k=4))
+          pw = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+          ip = "192.168." + str(random.randint(2,250)) + "." + str(random.randint(2,250))
+          with open("rdp-credentials.txt","w") as f:
+              f.write(f"USER={user}\nPASS={pw}\nIP={ip}\n")
+          print(f"::set-output name=user::{user}")
+          print(f"::set-output name=pass::{pw}")
+          print(f"::set-output name=ip::{ip}")
+        shell: python
+
+      - name: Show generated credentials
+        run: |
+          echo "User: ${{ steps.creds.outputs.user }}"
+          echo "Pass: ${{ steps.creds.outputs.pass }}"
+          echo "IP:   ${{ steps.creds.outputs.ip }}"
+
+      - name: Vast.ai search / deploy
+        run: |
+          if [ -z "${{ secrets.VAST_API_KEY }}" ]; then
+            echo "⚠️ Nu exista VAST_API_KEY -> fac doar search oferte"
+            curl -s "https://vast.ai/api/v0/bundles?verified=true&gpu_name=RTX%203060%20Ti&min_ram=64000&min_disk=1000" | jq '.offers[0]'
+            echo "Lease real necesita VAST_API_KEY"
+          else
+            echo "Aici ar fi codul pentru create lease cu VAST_API_KEY"
+          fi > deploy-log.txt
+
+      - name: Setup Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg2
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=${{ github.event.inputs.hostname }}
+
+      - name: Upload RDP credentials
+        uses: actions/upload-artifact@v3
+        with:
+          name: rdp-credentials
+          path: rdp-credentials.txt
+
+      - name: Upload deploy log
+        uses: actions/upload-artifact@v3
+        with:
+          name: deploy-log
+          path: deploy-log.txt
+          
