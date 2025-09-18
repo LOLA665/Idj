@@ -1,0 +1,201 @@
+name: Create RDP VM (Vast.ai) and Join Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Tailscale hostname for the instance (optional)'
+        required: false
+        default: gh-rdp
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.deploy.outputs.instance_ip }}
+      instance_user: ${{ steps.deploy.outputs.instance_user }}
+      instance_pass: ${{ steps.deploy.outputs.instance_pass }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Create and run deploy script
+        id: deploy
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          GITHUB_OUTPUT: ${{ github.output }}
+          HOSTNAME: ${{ github.event.inputs.hostname }}
+        run: |
+          cat > deploy_vast.py <<'PY'
+#!/usr/bin/env python3
+# Best-effort automated deploy script for Vast.ai -> create a 6-hour instance,
+# install desktop + xrdp, join Tailscale using provided auth key, and create a
+# random user/password. Outputs instance_ip, username, password to GitHub Outputs.
+
+import os, sys, time, json, secrets, string, requests
+
+VAST_API_KEY = os.environ.get('VAST_API_KEY')
+TAILSCALE_AUTH_KEY = os.environ.get('TAILSCALE_AUTH_KEY')
+HOSTNAME = os.environ.get('HOSTNAME','gh-rdp')
+GITHUB_OUTPUT = os.environ.get('GITHUB_OUTPUT')
+
+# helper to write GitHub outputs
+def gh_output(k,v):
+    if GITHUB_OUTPUT:
+        with open(os.environ.get('GITHUB_OUTPUT'),'a') as f:
+            f.write(f"{k}={v}
+")
+    else:
+        # fallback: print as clear marker
+        print(f"GITHUB_OUTPUT: {k}={v}")
+
+# generate random credentials
+def gen_creds():
+    uname = 'u' + ''.join(secrets.choice(string.ascii_lowercase+string.digits) for _ in range(8))
+    pwd = ''.join(secrets.choice(string.ascii_letters+string.digits+'!@#$%') for _ in range(16))
+    return uname, pwd
+
+username, password = gen_creds()
+print('Generated:', username)
+
+# If no TAILSCALE_AUTH_KEY -> abort
+if not TAILSCALE_AUTH_KEY:
+    print('ERROR: TAILSCALE_AUTH_KEY secret must be set in repo. Aborting.')
+    sys.exit(2)
+
+# If no VAST_API_KEY, run in dry-run mode: search and print suggested offer info
+if not VAST_API_KEY:
+    print('
+DRY-RUN MODE: no VAST_API_KEY provided. Will search public bundle listings and exit.
+')
+    search_url = 'https://api.vast.ai/v0/bundles'
+    params = {'type':'on-demand','verified':'true','q':'gpu:3060; ram:64000; disk:1000; cpu_vendor:intel'}
+    r = requests.get(search_url, params=params, timeout=20)
+    if r.status_code == 200:
+        data = r.json()
+        offers = data.get('offers') or data.get('bundles') or []
+        if not offers:
+            print('No offers found in public search. Use the Vast.ai UI to find a matching host (gpu ~3060, ram >=64GB, disk >=1TB).')
+        else:
+            print('Top offers (first 5):')
+            for o in offers[:5]:
+                print(json.dumps(o, indent=2))
+    else:
+        print('Search failed:', r.status_code, r.text[:500])
+    print('
+To create automatically, add VAST_API_KEY secret and re-run the workflow.')
+    sys.exit(0)
+
+# Create user-data startup script (cloud-init / sh) that will run on the host
+user_data = f"""#!/bin/bash
+set -e
+# create user with password
+useradd -m -s /bin/bash {username} || true
+echo '{username}:{password}' | chpasswd || true
+usermod -aG sudo {username} || true
+
+# install basic desktop & xrdp (Debian/Ubuntu best-effort)
+if [ -x /usr/bin/apt ]; then
+  DEBIAN_FRONTEND=noninteractive apt update
+  apt install -y --no-install-recommends ubuntu-desktop xrdp curl ca-certificates sudo
+  systemctl enable xrdp --now || true
+fi
+
+# install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh || true
+# bring up tailscale with the authkey and hostname
+tailscale up --authkey={TAILSCALE_AUTH_KEY} --hostname={HOSTNAME} --accept-routes --accept-dns || true
+
+# ensure SSH key if provided
+if [ -n "{os.environ.get('SSH_PUBKEY','')}" ]; then
+  mkdir -p /home/{username}/.ssh
+  echo "{os.environ.get('SSH_PUBKEY','')}" >> /home/{username}/.ssh/authorized_keys
+  chown -R {username}:{username} /home/{username}/.ssh
+  chmod 700 /home/{username}/.ssh
+  chmod 600 /home/{username}/.ssh/authorized_keys
+fi
+
+# print connection info to system log
+echo "RDP user: {username}" > /var/log/instance-credentials.txt || true
+echo "RDP pass: {password}" >> /var/log/instance-credentials.txt || true
+"""
+
+# Request a lease from Vast.ai
+create_url = 'https://api.vast.ai/v0/leases'
+search_url = 'https://api.vast.ai/v0/bundles'
+params = {'type':'on-demand','verified':'true','q':'gpu:3060; ram:64000; disk:1000; cpu_vendor:intel'}
+print('Searching for offers...')
+r = requests.get(search_url, params=params, timeout=30)
+if r.status_code != 200:
+    print('Search failed:', r.status_code, r.text[:1000])
+    sys.exit(1)
+items = r.json().get('offers') or r.json().get('bundles') or []
+if not items:
+    print('No matching offers found. Check Vast.ai UI for hosts matching GPU ~3060, RAM >=64GB, disk >=1TB.')
+    sys.exit(1)
+# choose cheapest
+offer = sorted(items, key=lambda o: float(o.get('price',9999)))[0]
+print('Selected offer id:', offer.get('id'))
+
+payload = {
+    'bundle_id': offer.get('id'),
+    'duration_hours': 6,
+    'user_data': user_data,
+}
+headers = {'Authorization': f'Bearer {VAST_API_KEY}','Content-Type':'application/json'}
+print('Requesting lease (this will consume funds on your Vast.ai account)...')
+resp = requests.post(create_url, json=payload, headers=headers, timeout=60)
+print('create status', resp.status_code)
+if resp.status_code >= 400:
+    print('create failed:', resp.text[:2000])
+    sys.exit(1)
+lease = resp.json()
+lease_id = lease.get('id') or lease.get('lease_id') or lease.get('lease')
+print('Lease response id:', lease_id)
+
+# poll for active and get ip
+status_url = f'https://api.vast.ai/v0/leases/{lease_id}'
+for _ in range(60):
+    r = requests.get(status_url, headers=headers, timeout=20)
+    if r.status_code == 200:
+        j = r.json()
+        st = j.get('status') or j.get('state') or ''
+        print('status:', st)
+        # try find public_ip in response
+        ip = j.get('ip') or j.get('public_ip') or j.get('access_ip') or None
+        if ip:
+            print('Found IP:', ip)
+            gh_output('instance_ip', ip)
+            gh_output('instance_user', username)
+            gh_output('instance_pass', password)
+            print('Done. Instance ready (may still be finishing startup processes).')
+            sys.exit(0)
+    else:
+        print('status poll failed', r.status_code, r.text[:500])
+    time.sleep(10)
+
+print('Timed out waiting for lease to expose an IP. Check Vast.ai console for details.')
+sys.exit(1)
+PY
+
+          python deploy_vast.py 2>&1 | tee deploy.log
+
+      - name: Upload deploy log
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-log
+          path: deploy.log
+
+      - name: Read outputs from deploy log (best-effort)
+        run: |
+          # GitHub outputs are set by the Python script using the GITHUB_OUTPUT file.
+          echo "Workflow finished. If creation succeeded, outputs instance_ip/instance_user/instance_pass are set." 
+          
