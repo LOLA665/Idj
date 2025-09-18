@@ -1,0 +1,111 @@
+name: Windows 11 RDP VM + Auto Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Tailscale hostname'
+        required: false
+        default: rdp-windows
+
+jobs:
+  deploy-windows-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests || true
+
+      - name: Generate random credentials
+        id: creds
+        run: |
+          import secrets, string, random
+          user = 'user' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+          pw = ''.join(secrets.choice(string.ascii_letters + string.digits + '!@#$%&*') for _ in range(16))
+          with open('rdp-credentials.txt', 'w') as f:
+              f.write(f'USER={user}\nPASS={pw}\nIP=0.0.0.0\n')
+          print(f"::set-output name=user::{user}")
+          print(f"::set-output name=pass::{pw}")
+        shell: python
+
+      - name: Create Python deployment script
+        run: |
+          cat > deploy_windows_vm_tailscale.py << 'EOF'
+import os, requests, time, secrets, string
+
+VAST_API_KEY = os.environ['VAST_API_KEY']
+TAILSCALE_KEY = os.environ['TAILSCALE_AUTH_KEY']
+HOSTNAME = os.environ.get('HOSTNAME', 'rdp-windows')
+
+# Generate random username/password
+user = 'user' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+pwd = ''.join(secrets.choice(string.ascii_letters + string.digits + '!@#$%&*') for _ in range(16))
+
+# Query Vast.ai for Windows 11 + RTX 3060 Ti + 32GB RAM + 1TB SSD + Intel CPU
+query = {
+    'type':'on-demand',
+    'verified':'true',
+    'q':'gpu:3060; ram:32768; disk:1000; cpu_vendor:intel; os:windows'
+}
+headers = {'Authorization': f'Bearer {VAST_API_KEY}', 'Content-Type':'application/json'}
+r = requests.get('https://api.vast.ai/v0/bundles', params=query, headers=headers)
+offers = r.json().get('offers') or []
+if not offers:
+    print('No Windows 11 offers found. Exiting.')
+    exit(1)
+
+offer = sorted(offers, key=lambda x: float(x.get('price',9999)))[0]
+print('Selected offer:', offer.get('id'))
+
+payload = {
+    'bundle_id': offer.get('id'),
+    'duration_hours': 6,
+    'user_data': f"<powershell>\nnet user Administrator {pwd}\nInvoke-WebRequest -Uri https://pkgs.tailscale.com/stable/tailscale.msi -OutFile C:\\Windows\\Temp\\tailscale.msi\nStart-Process msiexec.exe -ArgumentList '/i C:\\Windows\\Temp\\tailscale.msi /quiet /norestart' -Wait\nStart-Process 'C:\\Program Files\\Tailscale\\tailscale.exe' -ArgumentList 'up --authkey={TAILSCALE_KEY} --hostname={HOSTNAME}' -Wait\n</powershell>"
+}
+
+lease = requests.post('https://api.vast.ai/v0/leases', headers=headers, json=payload).json()
+lease_id = lease.get('id') or lease.get('lease_id')
+print('Lease id:', lease_id)
+
+# Poll for IP
+ip = None
+for _ in range(90):
+    status = requests.get(f'https://api.vast.ai/v0/leases/{lease_id}', headers=headers).json()
+    ip = status.get('ip') or status.get('public_ip') or status.get('access_ip')
+    if ip:
+        print('Found IP:', ip)
+        with open('rdp-credentials.txt','w') as f:
+            f.write(f'USER=Administrator\nPASS={pwd}\nIP={ip}\n')
+        break
+    time.sleep(10)
+
+if not ip:
+    print('Timed out getting IP. Check Vast.ai console.')
+EOF
+
+      - name: Run deployment script
+        run: python deploy_windows_vm_tailscale.py
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          HOSTNAME: ${{ github.event.inputs.hostname }}
+
+      - name: Show generated credentials
+        run: |
+          cat rdp-credentials.txt
+
+      - name: Upload RDP credentials artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: rdp-credentials.txt
+          
